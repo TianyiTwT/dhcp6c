@@ -31,6 +31,7 @@
 
 #include <sys/types.h>
 #include <sys/time.h>
+#include <time.h>	/* time(2)：Linux/bionic 下 sys/time.h 不再带出 */
 #include <sys/socket.h>
 #include <sys/queue.h>
 #include <sys/ioctl.h>

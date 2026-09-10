@@ -31,6 +31,8 @@
 #ifndef	_CONFIG_H_
 #define	_CONFIG_H_
 
+#include <sys/time.h>	/* struct timeval: 本头文件自身就要用，不该靠调用方捎带 */
+
 /* definitions of tail-queue types */
 TAILQ_HEAD(ia_conflist, ia_conf);
 TAILQ_HEAD(pifc_list, prefix_ifconf);

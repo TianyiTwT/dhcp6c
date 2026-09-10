@@ -2,3 +2,8 @@ config.cache
 config.log
 config.status
 Makefile
+
+# bison/flex 生成物（由 tools/build-dhcp6c-android.sh 按需生成）
+cfparse.c
+cftoken.c
+y.tab.h

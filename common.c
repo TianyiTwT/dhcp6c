@@ -91,11 +91,15 @@
 #ifdef __linux__
 /* from /usr/include/linux/ipv6.h */
 
+/* bionic 的 <netinet/in.h> 已经带出了 <linux/ipv6.h>，其中就有这个结构体，
+ * 再声明一次会 redefinition，所以 Android 下跳过。 */
+#ifndef __ANDROID__
 struct in6_ifreq {
 	struct in6_addr ifr6_addr;
 	uint32_t ifr6_prefixlen;
 	unsigned int ifr6_ifindex;
 };
+#endif
 #endif
 
 #define MAXDNAME 255
@@ -691,6 +695,7 @@ copy_authparam(struct authparam *authparam)
  * Home-brew function of a 64-bit version of ntohl.
  * XXX: is there any standard for this?
  */
+#ifndef ntohq	/* bionic 的 <sys/endian.h> 已把 ntohq 定义成宏，这里就不要再定义 */
 #if (BYTE_ORDER == LITTLE_ENDIAN)
 static __inline uint64_t
 ntohq(uint64_t x)
@@ -701,6 +706,7 @@ ntohq(uint64_t x)
 #else	/* (BYTE_ORDER == LITTLE_ENDIAN) */
 #define ntohq(x) (x)
 #endif
+#endif	/* ntohq */
 
 int
 dhcp6_auth_replaycheck(int method, uint64_t prev, uint64_t current)
@@ -971,7 +977,8 @@ in6_scope(struct in6_addr *addr)
 	if (addr->s6_addr[0] == 0xff)
 		return (addr->s6_addr[1] & 0x0f);
 
-	if (bcmp(&in6addr_loopback, addr, sizeof(addr) - 1) == 0) {
+	/* bcmp() 是 BSD 遗留函数，glibc 尚存但 bionic 已移除；语义与 memcmp 完全等价 */
+	if (memcmp(&in6addr_loopback, addr, sizeof(addr) - 1) == 0) {
 		if (addr->s6_addr[15] == 1) /* loopback */
 			return (1);
 		if (addr->s6_addr[15] == 0) /* unspecified */

@@ -133,7 +133,7 @@ void cf_init(void);
 %token ADDRPOOL POOLNAME RANGE TO ADDRESS_POOL
 %token INCLUDE
 
-%token NUMBER SLASH EOS BCL ECL STRING QSTRING PREFIX INFINITY
+%token NUMBER SLASH EOS BCL ECL STRING QSTRING PREFIX DUR_INFINITY
 %token COMMA
 %token RAW
 
@@ -977,7 +977,7 @@ poolparam:
 	;
 
 duration:
-		INFINITY
+		DUR_INFINITY
 		{
 			$$ = -1;
 		}

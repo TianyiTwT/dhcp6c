@@ -260,7 +260,7 @@ ecl		\}
 <S_CNF>eui-64 { DECHO; return (EUI64); }
 
 	/* duration */
-<S_CNF>infinity { DECHO; return (INFINITY); }
+<S_CNF>infinity { DECHO; return (DUR_INFINITY); }
 
 	/* authentication option */
 <S_CNF>authentication { DECHO; BEGIN S_AUTH; return (AUTHENTICATION); }
