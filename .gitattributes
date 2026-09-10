@@ -1,0 +1,12 @@
+# 换行符策略 —— 只约束本 fork 新增的 android/ 目录，不动上游文件。
+#
+# 为什么必须钉死 LF：
+#   android/dhcp6c-script 带 shebang "#!/system/bin/sh"，由 dhcp6c 直接 exec。
+#   一旦被换成 CRLF，内核解析出的解释器路径就成了 "/system/bin/sh\r"，
+#   exec 直接失败（No such file or directory），回调脚本永远起不来。
+#   android/build.sh 同理，会在 Linux/macOS/CI 上以 "command not found\r" 之类的
+#   怪错失败。
+#
+# 光靠仓库里存 LF 不够：使用者若开了 core.autocrlf=true（Windows 常见），
+# checkout 时仍会被转成 CRLF。eol=lf 把行为固定下来，与本地配置无关。
+android/*  text eol=lf
