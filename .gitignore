@@ -3,7 +3,11 @@ config.log
 config.status
 Makefile
 
-# bison/flex 生成物（由 tools/build-dhcp6c-android.sh 按需生成）
+# bison/flex 生成物（由 android/build.sh 按需生成）
 cfparse.c
 cftoken.c
 y.tab.h
+
+# android/build.sh 的产物
+android/build/
+android/dist/
