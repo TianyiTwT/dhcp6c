@@ -1,11 +1,24 @@
 #!/system/bin/sh
-# dhcp6c 回调脚本（Android）
+# dhcp6c 回调脚本（Android）—— 示例
 #
 # 契约：dhcp6c 调用该脚本时 argv 只有脚本路径本身，信息全在环境变量里。
-#   $REASON                  SOLICIT / REQUEST / RENEW / REBIND / RELEASE / EXIT / NBI
+#
+#   $REASON                  INIT / SOLICIT / INFOREQ / REQUEST / RENEW /
+#                            REBIND / RELEASE / IDLE / EXIT
+#                            取值来自 dhcp6_event_statestr()（common.c）
 #   $IFNAME                  接口名
-#   $NAINFO                  形如 "IAID=0 ADDRESS=2001:... PLTIME=9000 VLIFE=14400"
-#   $new_domain_name_servers 服务端下发的 DNS（本网络为空，见模块文档）
+#   $NAINFO                  "<地址>/128 <地址>/128 "
+#                            空格分隔，**末尾还带一个空格**。
+#                            由 dhcp6c_script.c 的 RENDER_IA 宏拼出，格式就是
+#                            "%s/128"，**没有** IAID / PLTIME / VLIFE 字段。
+#                            （早期的注释在这里写成 "IAID=0 ADDRESS=... PLTIME=...
+#                            VLIFE=..."，那是错的，已更正。）
+#   $new_domain_name_servers 服务端下发的 DNS，空格分隔（本网络为空）
+#
+# 解析 $NAINFO 的要点：shell 里 `set -- $NAINFO` 即可分词，取 $1 再去掉末尾
+# 的 "/128"。若需要与 /proc/net/if_inet6 比对，得先把冒号写法转成 32 位十六
+# 进制（注意处理 "::" 压缩），模块仓库的 scripts/dhcp6c-script 里有一份
+# awk 实现可以参考。
 #
 # 注意事项：
 #   1) 地址是由 dhcp6c 自己通过 ifaddrconf() 写进内核的，**不需要脚本代劳**。
