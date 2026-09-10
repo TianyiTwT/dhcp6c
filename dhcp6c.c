@@ -50,6 +50,9 @@
 #ifdef __FreeBSD__
 #include <net/if_var.h>
 #endif
+#ifdef __linux__
+#include <sys/file.h>	/* flock(2): glibc/bionic 未由 sys/param.h 带出 */
+#endif
 
 #include <netinet/in.h>
 #ifdef __KAME__
@@ -297,6 +300,348 @@ init_cli_if(int argc, char **argv) {
 	}
 }
 
+#ifdef __ANDROID__
+/*
+ * ============================ AF_PACKET 传输层 ============================
+ *
+ * 背景：Android 6.0 起系统自带一个 DHCPv6 客户端（NetworkStack / IpClient），
+ * 它随网络起来后长期占用 UDP 546 端口（Solicit 无限重传，socket 不释放），
+ * 于是本进程 bind(546) 必定 EADDRINUSE。绕开办法是避开 UDP 端口命名空间，
+ * 改用 AF_PACKET 原始套接字（需 CAP_NET_RAW，KernelSU/Magisk 的 root 有）
+ * 自行组装二层帧收发。协议逻辑（状态机、选项、事务 ID）一律不动，
+ * 只替换底层收发。
+ *
+ * 下面的实现与 tools/ia_na_probe.c 中已在真机验证通过的代码一致。
+ * =========================================================================
+ */
+
+#include <sys/ioctl.h>
+#include <linux/if_packet.h>
+#include <linux/filter.h>
+#include <linux/if_ether.h>
+
+#ifndef AF_PACKET
+#define AF_PACKET 17
+#endif
+#ifndef ETH_P_IPV6
+#define ETH_P_IPV6 0x86DD
+#endif
+
+#define AFPKT_PAYLOAD_MAX 4096
+
+/* 报文结构显式 packed，不依赖系统头文件布局 */
+struct afpkt_eth {
+	uint8_t  dst[6];
+	uint8_t  src[6];
+	uint16_t ethertype;
+} __attribute__((packed));
+
+struct afpkt_ip6 {
+	uint32_t vtcfl;		/* version(4) | traffic class(8) | flow label(20) */
+	uint16_t plen;
+	uint8_t  nxt;
+	uint8_t  hlim;
+	uint8_t  src[16];
+	uint8_t  dst[16];
+} __attribute__((packed));
+
+struct afpkt_udp {
+	uint16_t sport;
+	uint16_t dport;
+	uint16_t ulen;
+	uint16_t csum;
+} __attribute__((packed));
+
+/*
+ * 只放行「服务端 -> 客户端」的 DHCPv6 帧，其余全部在内核里就丢掉。
+ *
+ * 为什么必须收窄：socket 是 AF_PACKET 且**未绑接口**，挂在它上面的 BPF 会对
+ * 设备上任何接口的每个入帧求值。过滤器一旦放行，该帧立刻进 socket 队列并把
+ * 阻塞在 select() 里的进程唤醒——用户态醒来、recvfrom、发现不是我们要的、丢掉。
+ * 真机实测（放行全部 IPv6 时）：空载就有约 20 次/秒唤醒；跑流量时唤醒数几乎
+ * 等于设备收到的 IPv6 包数（2191 / 2250），即逐包唤醒。被 BPF 拒掉的帧根本
+ * 不进队列，也就永远不会唤醒进程，这部分代价直接归零。
+ *
+ * 判据与用户态 afpkt_recv() 的接受条件逐条一致，所以这是「零语义变化」的优化：
+ *   ethertype == 0x86dd          偏移 12（以太头内）
+ *   next header == 17 (UDP)      偏移 20 = 14 + 6（IPv6 头内第 6 字节）
+ *   UDP 源端口 == 547（服务端）   偏移 54 = 14 + 40
+ *   UDP 目的端口 == 546（客户端） 偏移 56 = 14 + 40 + 2
+ *
+ * 历史坑（务必看）：本项目最早的 UDP 过滤器把 next header 写成 ldb [6]，
+ * 那是**目的 MAC 的最后一字节**，不是 IPv6 头里的字段，于是判据恒假、服务端
+ * 回包全被拒，当时误判成「UDP-only 过滤在此内核上不可用」而退回放行全部 IPv6。
+ * 正确偏移是 20。改这里时先跑 tools/run-afpkt-selftest.sh 里的过滤器判定测试。
+ */
+static struct sock_filter afpkt_bpf_dhcp6[] = {
+	{ 0x28, 0, 0, 12 },		/* ldh  [12]        ; A = ethertype      */
+	{ 0x15, 0, 7, 0x86dd },		/* jeq  0x86dd      ; 非 IPv6 -> 拒绝   */
+	{ 0x30, 0, 0, 20 },		/* ldb  [20]        ; A = next header    */
+	{ 0x15, 0, 5, 17 },		/* jeq  17          ; 非 UDP  -> 拒绝   */
+	{ 0x28, 0, 0, 54 },		/* ldh  [54]        ; A = UDP sport      */
+	{ 0x15, 0, 3, 547 },		/* jeq  547         ; 非服务端 -> 拒绝  */
+	{ 0x28, 0, 0, 56 },		/* ldh  [56]        ; A = UDP dport      */
+	{ 0x15, 0, 1, 546 },		/* jeq  546         ; 非客户端 -> 拒绝  */
+	{ 0x06, 0, 0, 0xffff },		/* ret  0xffff      ; 放行             */
+	{ 0x06, 0, 0, 0 },		/* ret  0           ; 拒绝             */
+};
+
+static uint32_t
+afpkt_csum_add(uint32_t sum, const void *data, size_t len)
+{
+	const uint8_t *p = (const uint8_t *)data;
+
+	while (len > 1) {
+		sum += ((uint32_t)p[0] << 8) | (uint32_t)p[1];
+		p += 2;
+		len -= 2;
+	}
+	if (len)
+		sum += (uint32_t)p[0] << 8;
+	return sum;
+}
+
+static uint16_t
+afpkt_csum_finish(uint32_t sum)
+{
+	while (sum >> 16)
+		sum = (sum & 0xFFFF) + (sum >> 16);
+	return (uint16_t)~sum;
+}
+
+/* 由 IPv6 组播地址推导对应的以太网组播 MAC（33:33 + 后 4 字节） */
+static void
+afpkt_mcast_mac(const uint8_t ip6[16], uint8_t mac[6])
+{
+	mac[0] = 0x33;
+	mac[1] = 0x33;
+	memcpy(mac + 2, ip6 + 12, 4);
+}
+
+/* 取接口的 MAC 与链路本地地址。每次发送现取，避免链路变化后缓存过期 */
+static int
+afpkt_ifinfo(const char *ifname, uint8_t mac[6], struct in6_addr *ll)
+{
+	struct ifaddrs *ifa0 = NULL, *ifa;
+	int got_mac = 0, got_ll = 0;
+
+	if (getifaddrs(&ifa0) != 0)
+		return (-1);
+
+	for (ifa = ifa0; ifa; ifa = ifa->ifa_next) {
+		if (ifa->ifa_addr == NULL ||
+		    strcmp(ifa->ifa_name, ifname) != 0)
+			continue;
+
+		if (!got_ll && ifa->ifa_addr->sa_family == AF_INET6) {
+			struct sockaddr_in6 *s6 =
+			    (struct sockaddr_in6 *)(void *)ifa->ifa_addr;
+			if (IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr)) {
+				*ll = s6->sin6_addr;
+				got_ll = 1;
+			}
+		}
+		if (!got_mac && ifa->ifa_addr->sa_family == AF_PACKET) {
+			struct sockaddr_ll *sll =
+			    (struct sockaddr_ll *)(void *)ifa->ifa_addr;
+			if (sll->sll_halen == 6) {
+				memcpy(mac, sll->sll_addr, 6);
+				got_mac = 1;
+			}
+		}
+	}
+
+	freeifaddrs(ifa0);
+
+	if (!got_mac || !got_ll)
+		return (-1);
+	return (0);
+}
+
+/* 组装「以太 + IPv6 + UDP + DHCPv6」整帧，返回帧长；越界返回 -1 */
+static ssize_t
+afpkt_build(uint8_t *frame, const uint8_t src_mac[6],
+    const struct in6_addr *src, const struct in6_addr *dst,
+    const uint8_t *payload, size_t paylen)
+{
+	struct afpkt_eth *eth = (struct afpkt_eth *)(void *)frame;
+	struct afpkt_ip6 *ip6 =
+	    (struct afpkt_ip6 *)(void *)(frame + sizeof(*eth));
+	struct afpkt_udp *udp =
+	    (struct afpkt_udp *)(void *)((uint8_t *)ip6 + sizeof(*ip6));
+	uint8_t *pl = (uint8_t *)udp + sizeof(*udp);
+	uint16_t ulen;
+	uint32_t sum;
+	uint16_t ck;
+
+	if (paylen > 0xffff - sizeof(*udp))
+		return (-1);
+	ulen = (uint16_t)(sizeof(*udp) + paylen);
+
+	afpkt_mcast_mac(dst->s6_addr, eth->dst);
+	memcpy(eth->src, src_mac, 6);
+	eth->ethertype = htons(ETH_P_IPV6);
+
+	memset(ip6, 0, sizeof(*ip6));
+	ip6->vtcfl = htonl(0x60000000u);
+	ip6->plen = htons(ulen);
+	ip6->nxt = 17;			/* UDP */
+	ip6->hlim = 1;			/* RFC 8415：客户端->服务端跳数 = 1 */
+	memcpy(ip6->src, src->s6_addr, 16);
+	memcpy(ip6->dst, dst->s6_addr, 16);
+
+	udp->sport = htons(546);
+	udp->dport = htons(547);
+	udp->ulen = htons(ulen);
+	udp->csum = 0;
+
+	memcpy(pl, payload, paylen);
+
+	/*
+	 * UDP 校验和：IPv6 下必填，而 AF_PACKET 发送内核不会代算，必须自算。
+	 * 结果要按网络字节序写回，少一个 htons() 就会被对端静默丢弃。
+	 */
+	sum = 0;
+	sum = afpkt_csum_add(sum, ip6->src, 16);
+	sum = afpkt_csum_add(sum, ip6->dst, 16);
+	{
+		uint8_t pseudo[8];
+
+		pseudo[0] = pseudo[1] = pseudo[2] = pseudo[3] = 0;
+		pseudo[4] = (uint8_t)(ulen >> 24);
+		pseudo[5] = (uint8_t)(ulen >> 16);
+		pseudo[6] = (uint8_t)(ulen >> 8);
+		pseudo[7] = (uint8_t)ulen;
+		sum = afpkt_csum_add(sum, pseudo, 8);
+	}
+	{
+		uint8_t nxt4[4] = { 0, 0, 0, 17 };
+
+		sum = afpkt_csum_add(sum, nxt4, 4);
+	}
+	sum = afpkt_csum_add(sum, udp, sizeof(*udp));
+	sum = afpkt_csum_add(sum, pl, paylen);
+	ck = afpkt_csum_finish(sum);
+	if (ck == 0)
+		ck = 0xffff;
+	udp->csum = htons(ck);
+
+	return ((ssize_t)(sizeof(*eth) + sizeof(*ip6) + ulen));
+}
+
+/* 发送一条 DHCPv6 消息（载荷 buf/len），成功返回 0 */
+static int
+afpkt_send(struct dhcp6_if *ifp, const uint8_t *buf, size_t len)
+{
+	static uint8_t frame[sizeof(struct afpkt_eth) + sizeof(struct afpkt_ip6) +
+	    sizeof(struct afpkt_udp) + AFPKT_PAYLOAD_MAX];
+	struct sockaddr_ll sll;
+	struct in6_addr src, dst;
+	uint8_t mac[6];
+	ssize_t framelen;
+
+	if (len > AFPKT_PAYLOAD_MAX) {
+		errno = EMSGSIZE;
+		return (-1);
+	}
+	if (afpkt_ifinfo(ifp->ifname, mac, &src) != 0) {
+		d_printf(LOG_ERR, FNAME,
+		    "afpkt: 接口 %s 上取不到 MAC 或链路本地地址", ifp->ifname);
+		errno = EADDRNOTAVAIL;
+		return (-1);
+	}
+	if (inet_pton(AF_INET6, DH6ADDR_ALLAGENT, &dst) != 1) {
+		errno = EINVAL;
+		return (-1);
+	}
+
+	if ((framelen = afpkt_build(frame, mac, &src, &dst, buf, len)) < 0) {
+		errno = EMSGSIZE;
+		return (-1);
+	}
+
+	memset(&sll, 0, sizeof(sll));
+	sll.sll_family = AF_PACKET;
+	sll.sll_protocol = htons(ETH_P_IPV6);
+	sll.sll_ifindex = (int)ifp->linkid;
+	sll.sll_halen = 6;
+	afpkt_mcast_mac(dst.s6_addr, sll.sll_addr);
+
+	if (sendto(sock, frame, (size_t)framelen, 0,
+	    (struct sockaddr *)&sll, sizeof(sll)) < 0)
+		return (-1);
+
+	return (0);
+}
+
+/*
+ * 收一条 DHCPv6 应答：从整帧里剥出 UDP 载荷写回 rbuf，同时给出源 IPv6
+ * 地址（填 from）与入接口索引（填 pi）。返回载荷长度；非本协议报文或
+ * 出错返回 -1。
+ */
+static ssize_t
+afpkt_recv(uint8_t *rbuf, size_t rbufsize, struct sockaddr_storage *from,
+    struct in6_pktinfo *pi)
+{
+	static uint8_t frame[sizeof(struct afpkt_eth) + sizeof(struct afpkt_ip6) +
+	    65536];
+	struct sockaddr_ll sll;
+	socklen_t slen = sizeof(sll);
+	struct afpkt_eth *eth;
+	struct afpkt_ip6 *ip6;
+	struct afpkt_udp *udp;
+	uint8_t *pl;
+	size_t paylen;
+	ssize_t n;
+
+	n = recvfrom(sock, frame, sizeof(frame), 0,
+	    (struct sockaddr *)&sll, &slen);
+	if (n < 0) {
+		if (errno == EINTR)
+			return (-1);
+		d_printf(LOG_ERR, FNAME, "recvfrom(AF_PACKET): %s",
+		    strerror(errno));
+		return (-1);
+	}
+
+	if ((size_t)n < sizeof(*eth) + sizeof(*ip6) + sizeof(*udp))
+		return (-1);
+	eth = (struct afpkt_eth *)(void *)frame;
+	if (ntohs(eth->ethertype) != ETH_P_IPV6)
+		return (-1);
+	ip6 = (struct afpkt_ip6 *)(void *)(frame + sizeof(*eth));
+	if ((ntohl(ip6->vtcfl) >> 28) != 6 || ip6->nxt != 17)
+		return (-1);
+	udp = (struct afpkt_udp *)(void *)((uint8_t *)ip6 + sizeof(*ip6));
+
+	/* 只收服务端->客户端方向；本机自己发出的帧 dport=547，天然排除 */
+	if (ntohs(udp->dport) != 546 || ntohs(udp->sport) != 547)
+		return (-1);
+
+	pl = (uint8_t *)udp + sizeof(*udp);
+	paylen = (size_t)ntohs(udp->ulen);
+	if (paylen < sizeof(*udp))
+		return (-1);
+	paylen -= sizeof(*udp);
+	if (pl + paylen > frame + n)
+		paylen = (size_t)(frame + n - pl);
+	if (paylen > rbufsize)
+		return (-1);
+
+	memcpy(rbuf, pl, paylen);
+
+	memset(from, 0, sizeof(*from));
+	from->ss_family = AF_INET6;
+	memcpy(&((struct sockaddr_in6 *)(void *)from)->sin6_addr,
+	    ip6->src, 16);
+
+	memset(pi, 0, sizeof(*pi));
+	pi->ipi6_ifindex = (unsigned int)sll.sll_ifindex;
+
+	return ((ssize_t)paylen);
+}
+#endif /* __ANDROID__ */
+
 void
 client6_init(void)
 {
@@ -321,11 +666,25 @@ client6_init(void)
 		    gai_strerror(error));
 		exit(1);
 	}
+#ifdef __ANDROID__
+	/*
+	 * Android：系统 DHCPv6 客户端长期占用 UDP 546，bind(546) 必失败。
+	 * 改用 AF_PACKET 原始套接字在二层收发，绕开 UDP 端口命名空间。
+	 * 上面的 getaddrinfo 结果只用于保证流程一致，下面随之释放。
+	 */
+	sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IPV6));
+	if (sock < 0) {
+		d_printf(LOG_ERR, FNAME, "socket(AF_PACKET): %s",
+		    strerror(errno));
+		exit(1);
+	}
+#else
 	sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
 	if (sock < 0) {
 		d_printf(LOG_ERR, FNAME, "socket");
 		exit(1);
 	}
+#endif
 
 	if ((on = fcntl(sock, F_GETFL, 0)) == -1) {
 		d_printf(LOG_ERR, FNAME, "fctnl getflags");
@@ -339,6 +698,23 @@ client6_init(void)
 		exit(1);
 	}
 
+#ifdef __ANDROID__
+	/* fd 已是 AF_PACKET，IP 层选项无意义，挂上 BPF 即可 */
+	{
+		struct sock_fprog fprog;
+
+		fprog.len = (unsigned short)(sizeof(afpkt_bpf_dhcp6) /
+		    sizeof(afpkt_bpf_dhcp6[0]));
+		fprog.filter = afpkt_bpf_dhcp6;
+		if (setsockopt(sock, SOL_SOCKET, SO_ATTACH_FILTER,
+		    &fprog, sizeof(fprog)) < 0) {
+			d_printf(LOG_ERR, FNAME,
+			    "setsockopt(SO_ATTACH_FILTER): %s",
+			    strerror(errno));
+			exit(1);
+		}
+	}
+#else
 	on = 1;
 	if (setsockopt(sock, SOL_SOCKET, SO_REUSEPORT,
 		       &on, sizeof(on)) < 0) {
@@ -388,6 +764,7 @@ client6_init(void)
 		d_printf(LOG_ERR, FNAME, "bind: %s", strerror(errno));
 		exit(1);
 	}
+#endif /* __ANDROID__ */
 	freeaddrinfo(res);
 
 	memset(&hints, 0, sizeof(hints));
@@ -1217,12 +1594,21 @@ client6_send(struct dhcp6_event *ev)
 	dst = *sa6_allagent;
 	dst.sin6_scope_id = ifp->linkid;
 
+#ifdef __ANDROID__
+	/* AF_PACKET：自行组二层帧发出，dst 仅用于日志 */
+	if (afpkt_send(ifp, (const uint8_t *)buf, (size_t)len) != 0) {
+		d_printf(LOG_ERR, FNAME,
+		    "transmit failed: %s", strerror(errno));
+		goto end;
+	}
+#else
 	if (sendto(sock, buf, len, 0, (struct sockaddr *)&dst,
 	    sysdep_sa_len((struct sockaddr *)&dst)) == -1) {
 		d_printf(LOG_ERR, FNAME,
 		    "transmit failed: %s", strerror(errno));
 		goto end;
 	}
+#endif
 
 	d_printf(LOG_DEBUG, FNAME, "send %s to %s",
 	    dhcp6msgstr(dh6->dh6_msgtype), addr2str((struct sockaddr *)&dst));
@@ -1257,18 +1643,33 @@ tv_sub(struct timeval *a, struct timeval *b, struct timeval *result)
 static void
 client6_recv(void)
 {
-	char rbuf[BUFSIZ], cmsgbuf[BUFSIZ];
-	struct msghdr mhdr;
-	struct iovec iov;
+	char rbuf[BUFSIZ];
 	struct sockaddr_storage from;
 	struct dhcp6_if *ifp;
 	struct dhcp6opt *p, *ep;
 	struct dhcp6_optinfo optinfo;
 	ssize_t len;
 	struct dhcp6 *dh6;
-	struct cmsghdr *cm;
 	struct in6_pktinfo *pi = NULL;
+#ifdef __ANDROID__
+	struct in6_pktinfo pi_storage;
+#else
+	char cmsgbuf[BUFSIZ];
+	struct msghdr mhdr;
+	struct iovec iov;
+	struct cmsghdr *cm;
+#endif
 
+#ifdef __ANDROID__
+	/*
+	 * AF_PACKET：收整帧，剥出 UDP 载荷，并直接得到源地址与入接口。
+	 * 返回后 from / pi 均已填好，无需再走 CMSG。
+	 */
+	if ((len = afpkt_recv(rbuf, sizeof(rbuf), &from,
+	    &pi_storage)) < 0)
+		return;
+	pi = &pi_storage;
+#else
 	memset(&iov, 0, sizeof(iov));
 	memset(&mhdr, 0, sizeof(mhdr));
 
@@ -1298,6 +1699,7 @@ client6_recv(void)
 		d_printf(LOG_NOTICE, FNAME, "failed to get packet info");
 		return;
 	}
+#endif /* __ANDROID__ */
 
 	if ((ifp = find_ifconfbyid((unsigned int)pi->ipi6_ifindex)) == NULL) {
 		d_printf(LOG_DEBUG, FNAME,
